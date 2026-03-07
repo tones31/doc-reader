@@ -6,13 +6,14 @@ import uuid
 from pathlib import Path
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi import HTTPException
 from pydantic import BaseModel
 from openai import OpenAI
 from dotenv import load_dotenv
 from chromadb.utils import embedding_functions
 from pypdf import PdfReader
+import storage as storage_module
 
 load_dotenv()
 
@@ -24,10 +25,7 @@ class DocumentRequest(BaseModel):
 class QuestionRequest(BaseModel):
     question: str
 
-# Constants
-
-UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR"))
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+# Constants (storage uses S3 when BUCKET + credentials set; else local UPLOAD_DIR)
 
 openai_api_key = os.getenv("OPEN_API_KEY")
 app = FastAPI()
@@ -197,8 +195,8 @@ def ingest_pdf(file: UploadFile = File(...)):
         pass  # No existing docs with this filename
 
     content = file.file.read()
-    file_path = UPLOAD_DIR / safe_filename(file.filename)
-    file_path.write_bytes(content)
+    safe = safe_filename(file.filename)
+    storage_module.save_file(safe, content)
 
     text = extract_text_from_pdf(io.BytesIO(content))
     doc_id = str(uuid.uuid4())
@@ -219,12 +217,12 @@ def ingest_pdf(file: UploadFile = File(...)):
 @app.get("/documents/download")
 def download_document(filename: str):
     safe = safe_filename(filename)
-    path = (UPLOAD_DIR / safe).resolve()
-    root = UPLOAD_DIR.resolve()
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail="Document not found")
-    try:
-        path.relative_to(root)
-    except ValueError:
+    if storage_module.is_s3():
+        url = storage_module.get_presigned_url(safe)
+        if not url:
+            raise HTTPException(status_code=404, detail="Document not found")
+        return RedirectResponse(url=url, status_code=302)
+    path = storage_module.get_file_path(safe)
+    if not path:
         raise HTTPException(status_code=404, detail="Document not found")
     return FileResponse(path, filename=filename, media_type="application/pdf")
