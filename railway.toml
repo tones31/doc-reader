@@ -3,7 +3,14 @@ name = "backend"
 startCommand = "uvicorn main:app --host 0.0.0.0 --port $PORT"
 healthcheckPath = "/health"
 
+[services.networking]
+[services.networking.serviceDomains]
+backend = {}
+
 [[services]]
 name = "frontend"
 startCommand = "streamlit run ui.py --server.port $PORT --server.address 0.0.0.0"
-healthcheckPath = "/"
+
+[services.networking]
+[services.networking.serviceDomains]
+frontend = {}
