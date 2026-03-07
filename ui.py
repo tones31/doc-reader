@@ -11,11 +11,15 @@ API_URL = os.getenv("API_URL")
 st.title("Document Reading Service")
 
 # Upload document
-uploaded_file = st.file_uploader("Upload a document", type=["pdf", "txt", "docx"])
+uploaded_file = st.file_uploader("Upload a document", type=["pdf", "txt"])
 if uploaded_file is not None: 
-    text = uploaded_file.read().decode("utf-8")
-    response = requests.post(f"{API_URL}/ingest", json={"text": text})
-    st.success(F"Document stored with ID: {response.json()['id']}")
+    if uploaded_file.type == "application/pdf":
+        response = requests.post(f"{API_URL}/ingest_pdf", files={"file": (uploaded_file.name, uploaded_file.getvalue(), "application/pdf")})
+        st.success(F"PDF stored with ID: {response.json()['id']}")
+    else:
+        text = uploaded_file.read().decode("utf-8")
+        response = requests.post(f"{API_URL}/ingest", json={"text": text})
+        st.success(F"Document stored with ID: {response.json()['id']}")
 
 # Ask a question
 question = st.text_input("Ask a question any of your uploaded documents")

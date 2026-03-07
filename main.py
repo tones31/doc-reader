@@ -1,11 +1,12 @@
 import os
 import chromadb
 import uuid
-from fastapi import FastAPI
+from fastapi import FastAPI, File, UploadFile
 from pydantic import BaseModel
 from openai import OpenAI
 from dotenv import load_dotenv
 from chromadb.utils import embedding_functions
+from pypdf import PdfReader
 
 load_dotenv()
 
@@ -33,6 +34,13 @@ class QuestionRequest(BaseModel):
 def create_question(question: str, context: str):
     return f"Use the following context to answer the question:\n\n{context}\n\nQuestion: {question}"
 
+def extract_text_from_pdf(pdf_path: str):
+    reader = PdfReader(pdf_path)
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text() + "\n"
+    return text
+
 @app.get("/")
 def root():
     return {"message": "AI server is running"}
@@ -42,7 +50,7 @@ def ask_question(request: QuestionRequest):
     # Embed and retrieve top 3 relevant documents
     results = collection.query(
         query_texts=[request.question],
-        n_results=3,
+        n_results=3
     )
 
     # Combine retrieved documents into a single context string
@@ -80,3 +88,8 @@ def ingest_document(request: DocumentRequest):
         "status": "stored",
         "id": doc_id
     }
+
+@app.post("/ingest_pdf")
+def ingest_pdf(file: UploadFile = File(...)):
+    text = extract_text_from_pdf(file.file)
+    return ingest_document(DocumentRequest(text=text))
