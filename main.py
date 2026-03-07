@@ -5,6 +5,7 @@ import chromadb
 import uuid
 from pathlib import Path
 from fastapi import FastAPI, File, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi import HTTPException
 from pydantic import BaseModel
@@ -30,6 +31,18 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 openai_api_key = os.getenv("OPEN_API_KEY")
 app = FastAPI()
+
+# CORS: allow frontend origin (set FRONTEND_URL on Railway to your Streamlit service URL)
+frontend_url = os.getenv("FRONTEND_URL").rstrip("/")
+allow_origins = [frontend_url]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allow_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 client = OpenAI(api_key=openai_api_key)
 chroma_client = chromadb.PersistentClient(path="chroma_db")
 
