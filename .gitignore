@@ -1,0 +1,55 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+*.pkl
+*.egg-info/
+*.egg
+*.sqlite3
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Chroma / local databases
+.chroma/
+chroma_db/
+*.db
+*.sqlite
+
+# Streamlit
+.streamlit/*
+!.streamlit/config.toml
+*.log
+*.lock
+*.tmp
+
+# Environment variables / secrets
+.env
+.env.*
+
+# IDEs / Editors
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# OS system files
+.DS_Store
+Thumbs.db
+
+# Testing / coverage
+.coverage
+.pytest_cache/
+htmlcov/
+
+# Optional / future tooling
+build/
+dist/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.uv/
