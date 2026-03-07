@@ -34,7 +34,6 @@ testfiles/
 .env.*
 
 # IDEs / Editors
-.vscode/
 .idea/
 *.sublime-workspace
 *.sublime-project
