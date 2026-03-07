@@ -1,7 +1,12 @@
+import io
 import os
+import re
 import chromadb
 import uuid
+from pathlib import Path
 from fastapi import FastAPI, File, UploadFile
+from fastapi.responses import FileResponse
+from fastapi import HTTPException
 from pydantic import BaseModel
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -15,13 +20,13 @@ load_dotenv()
 class DocumentRequest(BaseModel):
     text: str
 
-class SearchRequest(BaseModel):
-    query: str
-
 class QuestionRequest(BaseModel):
     question: str
 
 # Constants
+
+UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR"))
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 openai_api_key = os.getenv("OPEN_API_KEY")
 app = FastAPI()
@@ -40,11 +45,19 @@ collection = chroma_client.get_or_create_collection(
 
 # Functions
 
+def safe_filename(name: str) -> str:
+    """Return a safe basename for storage; prevents path traversal."""
+    base = os.path.basename(name)
+    base = base.replace("..", "").replace("/", "").replace("\\", "")
+    base = re.sub(r"[^\w\s.\-]", "", base).strip()
+    return base or "document"
+
 def create_question(question: str, context: str):
     return f"Use the following context to answer the question:\n\n{context}\n\nQuestion: {question}"
 
-def extract_text_from_pdf(pdf_path: str):
-    reader = PdfReader(pdf_path)
+def extract_text_from_pdf(source):
+    """Accept a file path (str) or file-like object (e.g. BytesIO)."""
+    reader = PdfReader(source)
     text = ""
     for page in reader.pages:
         text += page.extract_text() + "\n"
@@ -65,33 +78,86 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50):
 def root():
     return {"message": "AI server is running"}
 
+
+@app.post("/wipe")
+def wipe_collection():
+    """Remove all documents from the ChromaDB collection."""
+    result = collection.get(include=[])
+    ids = result["ids"] if result["ids"] else []
+    if ids:
+        collection.delete(ids=ids)
+    return {"status": "wiped", "deleted_count": len(ids)}
+
+
 @app.post("/ask")
 def ask_question(request: QuestionRequest):
-    # Embed and retrieve top 3 relevant documents
+    # Retrieve more chunks so multiple candidates can be represented
     results = collection.query(
         query_texts=[request.question],
-        n_results=3
+        n_results=15,
+        include=["metadatas", "documents", "distances"]
     )
 
-    # Combine retrieved documents into a single context string
     retrieved_documents = results["documents"][0]
-    context = "\n\n".join(retrieved_documents)
+    metadatas = results["metadatas"][0]
+    chunk_ids = results["ids"][0]
+    distances = results.get("distances")
+    dist_list = distances[0] if distances else None
 
-    # Send context + question to LLM
-    question = create_question(request.question, context)
+    # Rank by document: use best-chunk relevance (1 / (1 + min_distance)) or fallback to chunk count
+    scores = {}
+    filenames = {}
+    if dist_list is not None and len(dist_list) == len(metadatas):
+        for i, metadata_list in enumerate(metadatas):
+            meta = metadata_list or {}
+            doc_id = meta.get("id") or chunk_ids[i]
+            d = dist_list[i]
+            if doc_id not in scores or d < scores[doc_id]:
+                scores[doc_id] = d  # store min distance per doc (will convert to relevance)
+            if "filename" in meta:
+                filenames[doc_id] = meta["filename"]
+        # Convert min distance to relevance (higher = better), sort descending
+        ranked_candidates = [
+            {"id": doc_id, "score": round(1 / (1 + min_dist), 2), **({"filename": filenames[doc_id]} if doc_id in filenames else {})}
+            for doc_id, min_dist in sorted(scores.items(), key=lambda x: 1 / (1 + x[1]), reverse=True)
+        ]
+    else:
+        for i, metadata_list in enumerate(metadatas):
+            meta = metadata_list or {}
+            doc_id = meta.get("id") or chunk_ids[i]
+            scores[doc_id] = scores.get(doc_id, 0) + 1
+            if "filename" in meta:
+                filenames[doc_id] = meta["filename"]
+        ranked_candidates = [
+            {"id": doc_id, "score": score, **({"filename": filenames[doc_id]} if doc_id in filenames else {})}
+            for doc_id, score in sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        ]
+
+    # Build context with doc id prefix so the model can refer to candidates
+    context_parts = []
+    for i, doc in enumerate(retrieved_documents):
+        meta = metadatas[i] or {}
+        doc_id = meta.get("id") or chunk_ids[i]
+        name = filenames.get(doc_id, doc_id)
+        context_parts.append(f"[Candidate: {name}]\n{doc}")
+    context = "\n\n".join(context_parts)
+
+    # LLM with candidate-focused prompt
+    prompt = create_question(request.question, context)
     response = client.chat.completions.create(
         model="gpt-4.1-mini",
         messages=[
-            {"role": "system", "content": "You are a helpful assistant. ONLY answer using the provided context. Do NOT use any outside knowledge. If the context does not contain the answer, say 'I don't know'."},
-            {"role": "user", "content": question}
+            {"role": "system", "content": "You are a recruiter assistant. Answer the question using ONLY the provided resume excerpts. Say which candidate (by name or id) is best and why. If the context does not contain enough information, say so. Do NOT use any outside knowledge."},
+            {"role": "user", "content": prompt}
         ]
     )
 
     answer = response.choices[0].message.content
-    
+
     return {
         "answer": answer,
         "question": request.question,
+        "ranked_candidates": ranked_candidates,
         "retrieved_documents": retrieved_documents
     }
 
@@ -111,14 +177,23 @@ def ingest_document(request: DocumentRequest):
 
 @app.post("/ingest_pdf")
 def ingest_pdf(file: UploadFile = File(...)):
-    text = extract_text_from_pdf(file.file)
-    
+    # Overwrite by name: remove existing chunks with same filename
+    try:
+        collection.delete(where={"filename": file.filename})
+    except Exception:
+        pass  # No existing docs with this filename
+
+    content = file.file.read()
+    file_path = UPLOAD_DIR / safe_filename(file.filename)
+    file_path.write_bytes(content)
+
+    text = extract_text_from_pdf(io.BytesIO(content))
     doc_id = str(uuid.uuid4())
     chunks = chunk_text(text)
-    
+
     collection.add(
         documents=chunks,
-        metadatas=[{"id": doc_id}] * len(chunks),
+        metadatas=[{"id": doc_id, "filename": file.filename}] * len(chunks),
         ids=[str(uuid.uuid4()) for _ in chunks]
     )
 
@@ -126,24 +201,17 @@ def ingest_pdf(file: UploadFile = File(...)):
         "status": "stored",
         "id": doc_id
     }
-    
 
-@app.post("/search")
-def search(request: SearchRequest):
-    query_embeddings = embedding_function.embed_query(request.query)
-    results = collection.query(
-        query_embeddings=query_embeddings,
-        n_results=5
-    )
 
-    scores = {}
-    for i, metadata_list in enumerate(results["metadatas"][0]):
-        id = metadata_list["id"]
-        scores[id] = scores.get(id, 0) + 1
-    
-    top_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-
-    return {
-        "query": request.query,
-        "top_scores": top_scores
-    }
+@app.get("/documents/download")
+def download_document(filename: str):
+    safe = safe_filename(filename)
+    path = (UPLOAD_DIR / safe).resolve()
+    root = UPLOAD_DIR.resolve()
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Document not found")
+    try:
+        path.relative_to(root)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return FileResponse(path, filename=filename, media_type="application/pdf")

@@ -17,6 +17,8 @@ env/
 # Chroma / local databases
 .chroma/
 chroma_db/
+document_storage/
+testfiles/
 *.db
 *.sqlite
 
