@@ -2,6 +2,7 @@ import os
 import secrets
 import time
 import urllib.parse
+import logging
 from typing import Any
 
 import requests
@@ -11,9 +12,19 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 JWT_SECRET = os.getenv("JWT_SECRET")
+
+# Log which auth env vars are set at load (never log secret values)
+logger.info(
+    "Auth env: GOOGLE_CLIENT_ID=%s GOOGLE_CLIENT_SECRET=%s JWT_SECRET=%s",
+    "set" if GOOGLE_CLIENT_ID else "missing",
+    "set" if GOOGLE_CLIENT_SECRET else "missing",
+    "set" if JWT_SECRET else "missing",
+)
 
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -26,7 +37,9 @@ STATE_EXPIRY_SECONDS = 600  # 10 minutes
 
 # Returns True if Google OAuth and JWT are configured (GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, JWT_SECRET set).
 def auth_enabled() -> bool:
-    return bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and JWT_SECRET)
+    enabled = bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and JWT_SECRET)
+    logger.debug("auth_enabled() -> %s", enabled)
+    return enabled
 
 
 # Encodes a short-lived state JWT for OAuth CSRF protection (rnd + exp).

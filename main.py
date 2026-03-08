@@ -1,13 +1,21 @@
 import io
 import os
 import re
+import time
+import logging
 import chromadb
 import uuid
 from pathlib import Path
+
+# Configure logging before importing auth so auth's startup log is visible
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+
 from fastapi import FastAPI, File, UploadFile, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse, JSONResponse
 from fastapi import HTTPException
+from fastapi.exceptions import RequestValidationError
+from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -17,6 +25,59 @@ import storage as storage_module
 import auth
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+
+class RequestLoggingMiddleware(BaseHTTPMiddleware):
+    """Log every request: method, path, status code, duration. WARN for 4xx/5xx."""
+
+    async def dispatch(self, request: Request, call_next):
+        start = time.perf_counter()
+        method = request.method
+        path = request.url.path
+        try:
+            response = await call_next(request)
+            status = response.status_code
+            duration_ms = (time.perf_counter() - start) * 1000
+            if status >= 400:
+                logger.warning(
+                    "%s %s -> %s %.0fms",
+                    method,
+                    path,
+                    status,
+                    duration_ms,
+                )
+            else:
+                logger.info(
+                    "%s %s -> %s %.0fms",
+                    method,
+                    path,
+                    status,
+                    duration_ms,
+                )
+            return response
+        except HTTPException:
+            duration_ms = (time.perf_counter() - start) * 1000
+            logger.warning(
+                "%s %s -> HTTPException after %.0fms",
+                method,
+                path,
+                duration_ms,
+            )
+            raise
+        except Exception as e:
+            duration_ms = (time.perf_counter() - start) * 1000
+            logger.error(
+                "%s %s -> exception after %.0fms: %s",
+                method,
+                path,
+                duration_ms,
+                e,
+                exc_info=True,
+            )
+            raise
+
 
 # Models
 
@@ -31,6 +92,9 @@ class QuestionRequest(BaseModel):
 openai_api_key = os.getenv("OPEN_API_KEY")
 app = FastAPI()
 
+# Request logging (method, path, status, duration); WARN for 4xx/5xx
+app.add_middleware(RequestLoggingMiddleware)
+
 # CORS: allow frontend origin
 frontend_url = os.getenv("FRONTEND_URL").rstrip("/")
 allow_origins = [frontend_url]
@@ -41,6 +105,45 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(HTTPException)
+def http_exception_handler(request: Request, exc: HTTPException):
+    logger.warning(
+        "HTTPException %s %s -> %s %s",
+        request.method,
+        request.url.path,
+        exc.status_code,
+        exc.detail,
+    )
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+
+@app.exception_handler(RequestValidationError)
+def validation_exception_handler(request: Request, exc: RequestValidationError):
+    logger.warning(
+        "Validation error %s %s: %s",
+        request.method,
+        request.url.path,
+        exc.errors(),
+    )
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
+
+@app.exception_handler(Exception)
+def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.error(
+        "Unhandled exception %s %s: %s",
+        request.method,
+        request.url.path,
+        exc,
+        exc_info=True,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error"},
+    )
+
 
 client = OpenAI(api_key=openai_api_key)
 chroma_client = chromadb.PersistentClient(path="chroma_db")
@@ -133,10 +236,14 @@ def auth_google_callback(request: Request, code: str | None = None, state: str |
 # Returns current user email/name when authenticated. 401 when auth is on and not logged in.
 @app.get("/auth/me")
 def auth_me(user: dict | None = Depends(auth.get_current_user_optional)):
-    if not auth.auth_enabled():
+    enabled = auth.auth_enabled()
+    if not enabled:
+        logger.info("/auth/me: auth disabled, returning 200 (no login required)")
         return {"email": None, "name": None}
     if not user:
+        logger.info("/auth/me: auth enabled, no token/invalid -> 401 (show login)")
         raise HTTPException(status_code=401, detail="Not authenticated")
+    logger.debug("/auth/me: authenticated as %s", user.get("email"))
     return {"email": user.get("email"), "name": user.get("name"), "picture": user.get("picture")}
 
 

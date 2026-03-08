@@ -1,10 +1,14 @@
 import streamlit as st
 import requests
+import logging
 
 from dotenv import load_dotenv
 import os
 
 load_dotenv()
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 API_URL = os.getenv("API_URL")
 PAGE_SIZE = 10
@@ -41,7 +45,10 @@ def api_headers():
 # When no token, probe backend: 401 -> auth required (show login); 200 with email/name -> auth disabled, continue
 if not st.session_state.get("auth_token"):
     try:
-        me_resp = requests.get(f"{API_URL}/auth/me", timeout=5)
+        me_url = f"{API_URL}/auth/me" if API_URL else "/auth/me"
+        logger.info("Auth probe: no token, calling %s", me_url)
+        me_resp = requests.get(me_url, timeout=5)
+        logger.info("Auth probe: %s %s", me_resp.status_code, "-> show Google login" if me_resp.status_code == 401 else "-> continue without login")
         if me_resp.status_code == 401:
             _col_left, col_main, _col_right = st.columns([1, 5, 1])
             with col_main:
@@ -51,7 +58,8 @@ if not st.session_state.get("auth_token"):
                 st.link_button("Sign in with Google", login_url, type="primary")
             st.stop()
         # 200 or 501: auth disabled or not configured; show app without token
-    except Exception:
+    except Exception as e:
+        logger.warning("Auth probe failed (backend unreachable?): %s", e, exc_info=True)
         # Backend unreachable; show app anyway (will get errors on API calls)
         pass
 
