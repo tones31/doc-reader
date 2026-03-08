@@ -197,11 +197,23 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50):
 
 
 # Returns sanitized Google sub for storage/Chroma scoping, or None when auth disabled.
-def _user_id(user: dict | None) -> str | None:
+def user_id(user: dict | None) -> str | None:
     if not user:
         return None
     raw = (user.get("sub") or "").replace("/", "").replace("..", "")
     return raw if raw else None
+
+
+# Returns the base URL to use for OAuth redirect_uri: API_URL if set (with https default),
+# else https when behind a proxy (X-Forwarded-Proto), else request.base_url for local dev.
+def oauth_redirect_base(request: Request) -> str:
+    if backend_base_url:
+        return backend_base_url
+    proto = request.headers.get("X-Forwarded-Proto", "").strip().lower()
+    host = request.headers.get("X-Forwarded-Host", "").strip() or request.url.hostname
+    if proto == "https" and host:
+        return f"https://{host}"
+    return str(request.base_url).rstrip("/")
 
 
 # Routes
@@ -219,8 +231,9 @@ def root():
 def auth_google(request: Request):
     if not auth.auth_enabled():
         raise HTTPException(status_code=501, detail="Google SSO not configured")
-    base = backend_base_url or str(request.base_url).rstrip("/")
+    base = oauth_redirect_base(request)
     redirect_uri = base + "/auth/google/callback"
+    logger.info("OAuth redirect_uri: %s", redirect_uri)
     url, _state = auth.build_google_auth_url(redirect_uri)
     return RedirectResponse(url=url, status_code=302)
 
@@ -232,7 +245,7 @@ def auth_google_callback(request: Request, code: str | None = None, state: str |
         raise HTTPException(status_code=501, detail="Google SSO not configured")
     if not code or not state:
         raise HTTPException(status_code=400, detail="Missing code or state")
-    base = backend_base_url or str(request.base_url).rstrip("/")
+    base = oauth_redirect_base(request)
     redirect_uri = base + "/auth/google/callback"
     user = auth.exchange_code_for_user(code, state, redirect_uri)
     if not user:
@@ -260,7 +273,7 @@ def auth_me(user: dict | None = Depends(auth.get_current_user_optional)):
 # Removes all documents from the ChromaDB collection (when auth on: only current user's).
 @app.post("/wipe")
 def wipe_collection(user: dict | None = Depends(auth.get_current_user_optional)):
-    user_id = _user_id(user)
+    user_id = user_id(user)
     if user_id is not None:
         result = collection.get(where={"user_id": user_id}, include=[])
     else:
@@ -275,7 +288,7 @@ def wipe_collection(user: dict | None = Depends(auth.get_current_user_optional))
 @app.post("/ask")
 def ask_question(request: QuestionRequest, user: dict | None = Depends(auth.get_current_user_optional)):
     # Retrieve more chunks so multiple candidates can be represented
-    user_id = _user_id(user)
+    user_id = user_id(user)
     query_kwargs = dict(
         query_texts=[request.question],
         n_results=15,
@@ -352,7 +365,7 @@ def ask_question(request: QuestionRequest, user: dict | None = Depends(auth.get_
 @app.post("/ingest")
 def ingest_document(request: DocumentRequest, user: dict | None = Depends(auth.get_current_user_optional)):
     doc_id = str(uuid.uuid4())
-    user_id = _user_id(user)
+    user_id = user_id(user)
     add_kwargs = dict(documents=[request.text], ids=[doc_id])
     if user_id is not None:
         add_kwargs["metadatas"] = [{"user_id": user_id}]
@@ -365,7 +378,7 @@ def ingest_document(request: DocumentRequest, user: dict | None = Depends(auth.g
 # Uploads PDF to storage, extracts text, chunks it, and adds chunks to ChromaDB. Overwrites by filename (and user when auth on).
 @app.post("/ingest_pdf")
 def ingest_pdf(file: UploadFile = File(...), user: dict | None = Depends(auth.get_current_user_optional)):
-    user_id = _user_id(user)
+    user_id = user_id(user)
     # Overwrite by name (and user when auth on): remove existing chunks with same filename
     try:
         if user_id is not None:
@@ -401,7 +414,7 @@ def ingest_pdf(file: UploadFile = File(...), user: dict | None = Depends(auth.ge
 # Returns list of stored document names for UI table and download links.
 @app.get("/documents/list")
 def list_documents(user: dict | None = Depends(auth.get_current_user_optional)):
-    user_id = _user_id(user)
+    user_id = user_id(user)
     keys = storage_module.list_files(user_id=user_id)
     return {"documents": [{"name": os.path.basename(k)} for k in keys]}
 
@@ -420,7 +433,7 @@ def download_document(request: Request, filename: str):
                 user = auth.decode_session_token(token)
         if not user:
             raise HTTPException(status_code=401, detail="Not authenticated")
-    user_id = _user_id(user)
+    user_id = user_id(user)
     safe = safe_filename(filename)
     key = f"{user_id}/{safe}" if user_id else safe
     if user_id and not key.startswith(user_id + "/"):
