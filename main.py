@@ -90,6 +90,12 @@ class QuestionRequest(BaseModel):
 # Constants (storage uses S3 when BUCKET + credentials set; else local UPLOAD_DIR)
 
 openai_api_key = os.getenv("OPEN_API_KEY")
+# Backend public URL for OAuth redirect_uri (API_URL may omit protocol; we default to https)
+_api_url = (os.getenv("API_URL") or "").strip().rstrip("/")
+if _api_url and not _api_url.startswith(("http://", "https://")):
+    _api_url = "https://" + _api_url
+backend_base_url = _api_url or None  # None => use request.base_url in handlers
+
 app = FastAPI()
 
 # Request logging (method, path, status, duration); WARN for 4xx/5xx
@@ -213,7 +219,8 @@ def root():
 def auth_google(request: Request):
     if not auth.auth_enabled():
         raise HTTPException(status_code=501, detail="Google SSO not configured")
-    redirect_uri = str(request.base_url).rstrip("/") + "/auth/google/callback"
+    base = backend_base_url or str(request.base_url).rstrip("/")
+    redirect_uri = base + "/auth/google/callback"
     url, _state = auth.build_google_auth_url(redirect_uri)
     return RedirectResponse(url=url, status_code=302)
 
@@ -225,7 +232,8 @@ def auth_google_callback(request: Request, code: str | None = None, state: str |
         raise HTTPException(status_code=501, detail="Google SSO not configured")
     if not code or not state:
         raise HTTPException(status_code=400, detail="Missing code or state")
-    redirect_uri = str(request.base_url).rstrip("/") + "/auth/google/callback"
+    base = backend_base_url or str(request.base_url).rstrip("/")
+    redirect_uri = base + "/auth/google/callback"
     user = auth.exchange_code_for_user(code, state, redirect_uri)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid or expired login")
