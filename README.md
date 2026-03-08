@@ -9,6 +9,7 @@ A **resume search** app that lets you upload PDF/text resumes, index them with e
 - **Document library** — List and download uploaded resumes (paginated)
 - **Storage** — Local disk by default, or S3-compatible storage when configured
 - **Reset** — Wipe the vector DB from the Settings tab when you need a fresh start
+- **Google SSO** — When configured, sign in with Google; JWT is used for API auth
 
 ## Architecture
 
@@ -44,6 +45,18 @@ A **resume search** app that lets you upload PDF/text resumes, index them with e
    | `FRONTEND_URL` | Streamlit app URL for CORS (e.g. `http://localhost:8501`) |
    | `DOCUMENT_LOCAL_DIR` | Local folder for uploaded files when not using S3 (e.g. `document_storage`) |
 
+   **Optional (Google SSO):**
+
+   When set, the backend requires Google sign-in for all API routes except `/` and `/auth/*`. The frontend shows a "Sign in with Google" page when unauthenticated.
+
+   | Variable | Description |
+   |----------|-------------|
+   | `GOOGLE_CLIENT_ID` | OAuth 2.0 Client ID from Google Cloud Console |
+   | `GOOGLE_CLIENT_SECRET` | OAuth 2.0 Client secret |
+   | `JWT_SECRET` | Secret used to sign session JWTs (e.g. 32+ character random string) |
+
+   Configure in [Google Cloud Console](https://console.cloud.google.com/apis/credentials): create an OAuth 2.0 Client ID (Web application), add authorized redirect URI `https://<your-backend-host>/auth/google/callback` (and `http://localhost:8000/auth/google/callback` for local dev).
+
    **Optional (S3-compatible storage):**
 
    | Variable | Description |
@@ -78,12 +91,17 @@ A **resume search** app that lets you upload PDF/text resumes, index them with e
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/` | Health / status |
+| GET | `/auth/google` | Redirect to Google sign-in (when SSO configured) |
+| GET | `/auth/google/callback` | OAuth callback; redirects to frontend with `?token=...` |
+| GET | `/auth/me` | Current user email/name (Bearer token required when SSO on) |
 | POST | `/ingest` | Ingest raw text (`{"text": "..."}`) |
 | POST | `/ingest_pdf` | Ingest PDF (multipart `file`) |
 | POST | `/ask` | RAG Q&A (`{"question": "..."}`) → answer + ranked candidates + excerpts |
 | GET | `/documents/list` | List stored document names |
 | GET | `/documents/download?filename=...` | Download file (redirect to S3 presigned URL or file response) |
 | POST | `/wipe` | Delete all documents from the ChromaDB collection |
+
+When Google SSO is configured, `/ask`, `/ingest`, `/ingest_pdf`, `/documents/list`, `/documents/download`, and `/wipe` require an `Authorization: Bearer <token>` header (or `token` query param for download).
 
 ## Deployment (Railway)
 
@@ -98,6 +116,7 @@ Set in Railway:
 - `API_URL` → public URL of the backend service
 - `FRONTEND_URL` → public URL of the Streamlit service (no trailing slash)
 - `DOCUMENT_LOCAL_DIR` or the S3 variables if you use object storage
+- For Google SSO: `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `JWT_SECRET` (backend only)
 
 For production, add a `/health` route if your platform expects it (e.g. `healthcheckPath = "/health"` in `railway.toml`).
 

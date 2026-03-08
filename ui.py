@@ -11,6 +11,53 @@ PAGE_SIZE = 10
 
 st.set_page_config(page_title="Resume Search", page_icon="📄", layout="wide")
 
+# --- Auth: capture token from OAuth callback; gate to login when backend requires auth ---
+if "auth_token" not in st.session_state:
+    st.session_state.auth_token = None
+token_from_url = st.query_params.get("token")
+if token_from_url:
+    st.session_state.auth_token = token_from_url
+
+def api_headers():
+    """Authorization header when we have a token (backend may still allow unauthenticated when SSO not configured)."""
+    token = st.session_state.get("auth_token")
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+# When no token, probe backend: 401 -> auth required (show login); 200 with email/name -> auth disabled, continue
+if not st.session_state.auth_token:
+    try:
+        me_resp = requests.get(f"{API_URL}/auth/me", timeout=5)
+        if me_resp.status_code == 401:
+            _col_left, col_main, _col_right = st.columns([1, 5, 1])
+            with col_main:
+                st.title("Resume Search")
+                st.markdown("Sign in with Google to continue.")
+                login_url = f"{API_URL}/auth/google"
+                st.link_button("Sign in with Google", login_url, type="primary")
+            st.stop()
+        # 200 or 501: auth disabled or not configured; show app without token
+    except Exception:
+        # Backend unreachable; show app anyway (will get errors on API calls)
+        pass
+
+# Optional: cache user info for header/settings (call /auth/me when we have token)
+if st.session_state.auth_token and "auth_user" not in st.session_state:
+    try:
+        r = requests.get(f"{API_URL}/auth/me", headers=api_headers(), timeout=5)
+        if r.status_code == 200:
+            st.session_state.auth_user = r.json()
+        elif r.status_code == 401:
+            del st.session_state["auth_token"]
+            if "auth_user" in st.session_state:
+                del st.session_state["auth_user"]
+            st.rerun()
+        else:
+            st.session_state.auth_user = None
+    except Exception:
+        st.session_state.auth_user = None
+elif not st.session_state.auth_token and "auth_user" in st.session_state:
+    del st.session_state["auth_user"]
+
 # Centered: side margins + wide middle (header and content same width)
 _col_left, col_main, _col_right = st.columns([1, 5, 1])
 with col_main:
@@ -50,7 +97,11 @@ with tab_ask:
 
     if st.session_state.searching:
         with st.spinner("Finding candidates…"):
-            response = requests.post(f"{API_URL}/ask", json={"question": st.session_state.pending_question})
+            response = requests.post(
+                f"{API_URL}/ask",
+                json={"question": st.session_state.pending_question},
+                headers=api_headers(),
+            )
             response.raise_for_status()
             data = response.json()
         st.session_state.search_results = data
@@ -82,6 +133,8 @@ with tab_ask:
             with col3:
                 if c.get("filename", "").lower().endswith(".pdf"):
                     download_url = f"{API_URL}/documents/download?filename={requests.utils.quote(c['filename'])}"
+                    if st.session_state.get("auth_token"):
+                        download_url += f"&token={requests.utils.quote(st.session_state.auth_token)}"
                     st.link_button("Download PDF", download_url)
                 else:
                     st.write("—")
@@ -110,11 +163,16 @@ with tab_resumes:
                     response = requests.post(
                         f"{API_URL}/ingest_pdf",
                         files={"file": (uploaded_file.name, uploaded_file.getvalue(), "application/pdf")},
+                        headers=api_headers(),
                     )
                     results.append({"File name": uploaded_file.name, "Type": "PDF", "Status": "Stored"})
                 else:
                     text = uploaded_file.read().decode("utf-8")
-                    response = requests.post(f"{API_URL}/ingest", json={"text": text})
+                    response = requests.post(
+                        f"{API_URL}/ingest",
+                        json={"text": text},
+                        headers=api_headers(),
+                    )
                     results.append({"File name": uploaded_file.name, "Type": "Text", "Status": "Stored"})
             except Exception as e:
                 results.append({"File name": uploaded_file.name, "Type": "PDF" if uploaded_file.type == "application/pdf" else "Text", "Status": f"Error: {e}"})
@@ -147,7 +205,7 @@ with tab_resumes:
     if "document_list" not in st.session_state:
         try:
             with st.spinner("Loading document library…"):
-                list_resp = requests.get(f"{API_URL}/documents/list")
+                list_resp = requests.get(f"{API_URL}/documents/list", headers=api_headers())
                 list_resp.raise_for_status()
                 st.session_state.document_list = list_resp.json().get("documents", [])
         except Exception as e:
@@ -180,6 +238,8 @@ with tab_resumes:
             with col2:
                 if name.lower().endswith(".pdf"):
                     download_url = f"{API_URL}/documents/download?filename={requests.utils.quote(name)}"
+                    if st.session_state.get("auth_token"):
+                        download_url += f"&token={requests.utils.quote(st.session_state.auth_token)}"
                     st.link_button("Download", download_url)
                 else:
                     st.write("—")
@@ -196,13 +256,23 @@ with tab_resumes:
                 st.session_state.resumes_page = page + 1
                 st.rerun()
 
-# --- Settings tab: danger zone ---
+# --- Settings tab: danger zone + sign out ---
 with tab_settings:
     st.caption("App configuration and destructive actions.")
+    if st.session_state.get("auth_token"):
+        auth_user = st.session_state.get("auth_user") or {}
+        if auth_user.get("email"):
+            st.caption(f"Signed in as **{auth_user.get('email', '')}**")
+        if st.button("Sign out"):
+            del st.session_state["auth_token"]
+            if "auth_user" in st.session_state:
+                del st.session_state["auth_user"]
+            st.rerun()
+        st.divider()
     with st.expander("⚠️ Danger zone"):
         if st.checkbox("I want to reset the resume database"):
             if st.button("Reset database"):
-                response = requests.post(f"{API_URL}/wipe")
+                response = requests.post(f"{API_URL}/wipe", headers=api_headers())
                 st.success("Resume database reset.")
                 if "document_list" in st.session_state:
                     del st.session_state["document_list"]

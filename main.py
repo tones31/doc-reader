@@ -4,7 +4,7 @@ import re
 import chromadb
 import uuid
 from pathlib import Path
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, UploadFile, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi import HTTPException
@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from chromadb.utils import embedding_functions
 from pypdf import PdfReader
 import storage as storage_module
+import auth
 
 load_dotenv()
 
@@ -90,8 +91,47 @@ def root():
     return {"message": "AI server is running"}
 
 
+# --- Google OAuth + JWT (when GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, JWT_SECRET set) ---
+
+@app.get("/auth/google")
+def auth_google(request: Request):
+    """Redirect to Google consent screen. Callback is /auth/google/callback."""
+    if not auth.auth_enabled():
+        raise HTTPException(status_code=501, detail="Google SSO not configured")
+    redirect_uri = str(request.base_url).rstrip("/") + "/auth/google/callback"
+    url, _state = auth.build_google_auth_url(redirect_uri)
+    return RedirectResponse(url=url, status_code=302)
+
+
+@app.get("/auth/google/callback")
+def auth_google_callback(request: Request, code: str | None = None, state: str | None = None):
+    """Exchange code for user, create JWT, redirect to frontend with ?token=..."""
+    if not auth.auth_enabled():
+        raise HTTPException(status_code=501, detail="Google SSO not configured")
+    if not code or not state:
+        raise HTTPException(status_code=400, detail="Missing code or state")
+    redirect_uri = str(request.base_url).rstrip("/") + "/auth/google/callback"
+    user = auth.exchange_code_for_user(code, state, redirect_uri)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid or expired login")
+    token = auth.create_session_token(user)
+    return RedirectResponse(url=f"{frontend_url}?token={token}", status_code=302)
+
+
+@app.get("/auth/me")
+def auth_me(user: dict | None = Depends(auth.get_current_user_optional)):
+    """Return current user email/name when authenticated. 401 when auth is on and not logged in."""
+    if not auth.auth_enabled():
+        return {"email": None, "name": None}
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return {"email": user.get("email"), "name": user.get("name")}
+
+
+# --- Protected API (require JWT when auth enabled) ---
+
 @app.post("/wipe")
-def wipe_collection():
+def wipe_collection(_user: dict | None = Depends(auth.get_current_user_optional)):
     """Remove all documents from the ChromaDB collection."""
     result = collection.get(include=[])
     ids = result["ids"] if result["ids"] else []
@@ -101,7 +141,7 @@ def wipe_collection():
 
 
 @app.post("/ask")
-def ask_question(request: QuestionRequest):
+def ask_question(request: QuestionRequest, _user: dict | None = Depends(auth.get_current_user_optional)):
     # Retrieve more chunks so multiple candidates can be represented
     results = collection.query(
         query_texts=[request.question],
@@ -173,7 +213,7 @@ def ask_question(request: QuestionRequest):
     }
 
 @app.post("/ingest")
-def ingest_document(request: DocumentRequest):
+def ingest_document(request: DocumentRequest, _user: dict | None = Depends(auth.get_current_user_optional)):
     doc_id = str(uuid.uuid4())
 
     collection.add(
@@ -187,7 +227,7 @@ def ingest_document(request: DocumentRequest):
     }
 
 @app.post("/ingest_pdf")
-def ingest_pdf(file: UploadFile = File(...)):
+def ingest_pdf(file: UploadFile = File(...), _user: dict | None = Depends(auth.get_current_user_optional)):
     # Overwrite by name: remove existing chunks with same filename
     try:
         collection.delete(where={"filename": file.filename})
@@ -215,13 +255,25 @@ def ingest_pdf(file: UploadFile = File(...)):
 
 
 @app.get("/documents/list")
-def list_documents():
+def list_documents(_user: dict | None = Depends(auth.get_current_user_optional)):
     """Return list of stored document names for UI table and download links."""
     return {"documents": storage_module.list_files()}
 
 
 @app.get("/documents/download")
-def download_document(filename: str):
+def download_document(request: Request, filename: str):
+    # Require auth when enabled; allow token in query for download links (browser can't send Bearer on link click)
+    if auth.auth_enabled():
+        user = None
+        auth_header = request.headers.get("Authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            user = auth.decode_session_token(auth_header[7:].strip())
+        if not user:
+            token = request.query_params.get("token")
+            if token:
+                user = auth.decode_session_token(token)
+        if not user:
+            raise HTTPException(status_code=401, detail="Not authenticated")
     safe = safe_filename(filename)
     if storage_module.is_s3():
         url = storage_module.get_presigned_url(safe)
