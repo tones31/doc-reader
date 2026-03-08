@@ -20,6 +20,7 @@ s3_client = None
 upload_dir: Path | None = None
 
 
+# Returns the lazy-initialized S3 client singleton when S3 is configured; otherwise None.
 def get_s3_client():
     global s3_client
     if s3_client is None and use_s3:
@@ -33,7 +34,7 @@ def get_s3_client():
     return s3_client
 
 
-# Get upload directory
+# Returns the local upload directory path; creates it if missing. Used when not using S3.
 def get_upload_dir() -> Path:
     global upload_dir
     if upload_dir is None:
@@ -42,20 +43,22 @@ def get_upload_dir() -> Path:
     return upload_dir
 
 
+# Returns True if storage is configured to use S3; False for local disk.
 def is_s3() -> bool:
     return use_s3
 
-# Save file to S3 or local storage
+# Saves content to S3 (by key) or to local disk under the upload directory.
 def save_file(key: str, content: bytes) -> None:
     if use_s3:
         client = get_s3_client()
         client.put_object(Bucket=DOCUMENT_BUCKET, Key=key, Body=content)
     else:
         path = get_upload_dir() / key
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content)
 
 
-# Local file path
+# Returns the local file path for the given key when using local storage; None if S3 or key not found (path traversal safe).
 def get_file_path(key: str) -> Path | None:
     if use_s3:
         return None
@@ -70,7 +73,7 @@ def get_file_path(key: str) -> Path | None:
     return path
 
 
-# Presigned URL for S3
+# Returns a presigned GET URL for the key in S3, or None when using local storage or object missing. expires_in in seconds.
 def get_presigned_url(key: str, expires_in: int = 3600) -> str | None:
     if not use_s3:
         return None
@@ -87,21 +90,25 @@ def get_presigned_url(key: str, expires_in: int = 3600) -> str | None:
     return url
 
 
-def list_files() -> list[dict]:
-    """Return list of stored files. Each item: {"name": str} for display and download query param."""
+# Returns list of storage keys. When user_id is set, only keys under that prefix/folder.
+def list_files(user_id: str | None = None) -> list[str]:
     if use_s3:
         client = get_s3_client()
-        out: list[dict] = []
+        out: list[str] = []
+        prefix = f"{user_id}/" if user_id else ""
         paginator = client.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=DOCUMENT_BUCKET):
+        for page in paginator.paginate(Bucket=DOCUMENT_BUCKET, Prefix=prefix):
             for obj in page.get("Contents") or []:
                 key = obj.get("Key")
                 if key:
-                    out.append({"name": key})
-        return out
+                    out.append(key)
+        return sorted(out, key=str.lower)
     root = get_upload_dir()
-    out = []
-    for path in root.iterdir():
-        if path.is_file():
-            out.append({"name": path.name})
-    return sorted(out, key=lambda x: x["name"].lower())
+    if user_id:
+        dir_path = root / user_id
+        if not dir_path.is_dir():
+            return []
+        out = [f"{user_id}/{p.name}" for p in dir_path.iterdir() if p.is_file()]
+        return sorted(out, key=str.lower)
+    out = [p.name for p in root.iterdir() if p.is_file()]
+    return sorted(out, key=str.lower)

@@ -31,7 +31,7 @@ class QuestionRequest(BaseModel):
 openai_api_key = os.getenv("OPEN_API_KEY")
 app = FastAPI()
 
-# CORS: allow frontend origin (set FRONTEND_URL on Railway to your Streamlit service URL)
+# CORS: allow frontend origin
 frontend_url = os.getenv("FRONTEND_URL").rstrip("/")
 allow_origins = [frontend_url]
 app.add_middleware(
@@ -57,24 +57,26 @@ collection = chroma_client.get_or_create_collection(
 
 # Functions
 
+# Returns a safe basename for storage; prevents path traversal.
 def safe_filename(name: str) -> str:
-    """Return a safe basename for storage; prevents path traversal."""
     base = os.path.basename(name)
     base = base.replace("..", "").replace("/", "").replace("\\", "")
     base = re.sub(r"[^\w\s.\-]", "", base).strip()
     return base or "document"
 
+# Builds a prompt string: context plus question for the LLM.
 def create_question(question: str, context: str):
     return f"Use the following context to answer the question:\n\n{context}\n\nQuestion: {question}"
 
+# Extracts full text from a PDF. Accepts a file path (str) or file-like object (e.g. BytesIO).
 def extract_text_from_pdf(source):
-    """Accept a file path (str) or file-like object (e.g. BytesIO)."""
     reader = PdfReader(source)
     text = ""
     for page in reader.pages:
         text += page.extract_text() + "\n"
     return text
 
+# Splits text into overlapping chunks of chunk_size with overlap characters between chunks.
 def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50):
     chunks = []
     start = 0
@@ -84,8 +86,18 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50):
         start += chunk_size - overlap
     return chunks
 
+
+# Returns sanitized Google sub for storage/Chroma scoping, or None when auth disabled.
+def _user_id(user: dict | None) -> str | None:
+    if not user:
+        return None
+    raw = (user.get("sub") or "").replace("/", "").replace("..", "")
+    return raw if raw else None
+
+
 # Routes
 
+# Health check: returns a simple message that the AI server is running.
 @app.get("/")
 def root():
     return {"message": "AI server is running"}
@@ -93,9 +105,9 @@ def root():
 
 # --- Google OAuth + JWT (when GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, JWT_SECRET set) ---
 
+# Redirects to Google OAuth consent screen. Callback is /auth/google/callback.
 @app.get("/auth/google")
 def auth_google(request: Request):
-    """Redirect to Google consent screen. Callback is /auth/google/callback."""
     if not auth.auth_enabled():
         raise HTTPException(status_code=501, detail="Google SSO not configured")
     redirect_uri = str(request.base_url).rstrip("/") + "/auth/google/callback"
@@ -103,9 +115,9 @@ def auth_google(request: Request):
     return RedirectResponse(url=url, status_code=302)
 
 
+# Exchanges code for user, creates JWT, redirects to frontend with ?token=...
 @app.get("/auth/google/callback")
 def auth_google_callback(request: Request, code: str | None = None, state: str | None = None):
-    """Exchange code for user, create JWT, redirect to frontend with ?token=..."""
     if not auth.auth_enabled():
         raise HTTPException(status_code=501, detail="Google SSO not configured")
     if not code or not state:
@@ -118,36 +130,45 @@ def auth_google_callback(request: Request, code: str | None = None, state: str |
     return RedirectResponse(url=f"{frontend_url}?token={token}", status_code=302)
 
 
+# Returns current user email/name when authenticated. 401 when auth is on and not logged in.
 @app.get("/auth/me")
 def auth_me(user: dict | None = Depends(auth.get_current_user_optional)):
-    """Return current user email/name when authenticated. 401 when auth is on and not logged in."""
     if not auth.auth_enabled():
         return {"email": None, "name": None}
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    return {"email": user.get("email"), "name": user.get("name")}
+    return {"email": user.get("email"), "name": user.get("name"), "picture": user.get("picture")}
 
 
 # --- Protected API (require JWT when auth enabled) ---
 
+# Removes all documents from the ChromaDB collection (when auth on: only current user's).
 @app.post("/wipe")
-def wipe_collection(_user: dict | None = Depends(auth.get_current_user_optional)):
-    """Remove all documents from the ChromaDB collection."""
-    result = collection.get(include=[])
+def wipe_collection(user: dict | None = Depends(auth.get_current_user_optional)):
+    user_id = _user_id(user)
+    if user_id is not None:
+        result = collection.get(where={"user_id": user_id}, include=[])
+    else:
+        result = collection.get(include=[])
     ids = result["ids"] if result["ids"] else []
     if ids:
         collection.delete(ids=ids)
     return {"status": "wiped", "deleted_count": len(ids)}
 
 
+# Queries ChromaDB for relevant chunks, ranks candidates, and returns LLM answer with ranked_candidates and excerpts.
 @app.post("/ask")
-def ask_question(request: QuestionRequest, _user: dict | None = Depends(auth.get_current_user_optional)):
+def ask_question(request: QuestionRequest, user: dict | None = Depends(auth.get_current_user_optional)):
     # Retrieve more chunks so multiple candidates can be represented
-    results = collection.query(
+    user_id = _user_id(user)
+    query_kwargs = dict(
         query_texts=[request.question],
         n_results=15,
-        include=["metadatas", "documents", "distances"]
+        include=["metadatas", "documents", "distances"],
     )
+    if user_id is not None:
+        query_kwargs["where"] = {"user_id": user_id}
+    results = collection.query(**query_kwargs)
 
     retrieved_documents = results["documents"][0]
     metadatas = results["metadatas"][0]
@@ -212,59 +233,69 @@ def ask_question(request: QuestionRequest, _user: dict | None = Depends(auth.get
         "retrieved_documents": retrieved_documents
     }
 
+# Stores raw text as a single document in ChromaDB; returns status and document id.
 @app.post("/ingest")
-def ingest_document(request: DocumentRequest, _user: dict | None = Depends(auth.get_current_user_optional)):
+def ingest_document(request: DocumentRequest, user: dict | None = Depends(auth.get_current_user_optional)):
     doc_id = str(uuid.uuid4())
-
-    collection.add(
-        documents=[request.text],
-        ids=[doc_id]
-    )
-
+    user_id = _user_id(user)
+    add_kwargs = dict(documents=[request.text], ids=[doc_id])
+    if user_id is not None:
+        add_kwargs["metadatas"] = [{"user_id": user_id}]
+    collection.add(**add_kwargs)
     return {
         "status": "stored",
         "id": doc_id
     }
 
+# Uploads PDF to storage, extracts text, chunks it, and adds chunks to ChromaDB. Overwrites by filename (and user when auth on).
 @app.post("/ingest_pdf")
-def ingest_pdf(file: UploadFile = File(...), _user: dict | None = Depends(auth.get_current_user_optional)):
-    # Overwrite by name: remove existing chunks with same filename
+def ingest_pdf(file: UploadFile = File(...), user: dict | None = Depends(auth.get_current_user_optional)):
+    user_id = _user_id(user)
+    # Overwrite by name (and user when auth on): remove existing chunks with same filename
     try:
-        collection.delete(where={"filename": file.filename})
+        if user_id is not None:
+            collection.delete(where={"$and": [{"filename": file.filename}, {"user_id": user_id}]})
+        else:
+            collection.delete(where={"filename": file.filename})
     except Exception:
-        pass  # No existing docs with this filename
+        pass
 
     content = file.file.read()
     safe = safe_filename(file.filename)
-    storage_module.save_file(safe, content)
+    storage_key = f"{user_id}/{safe}" if user_id else safe
+    storage_module.save_file(storage_key, content)
 
     text = extract_text_from_pdf(io.BytesIO(content))
     doc_id = str(uuid.uuid4())
     chunks = chunk_text(text)
 
+    meta_base = {"id": doc_id, "filename": file.filename}
+    if user_id is not None:
+        meta_base["user_id"] = user_id
     collection.add(
         documents=chunks,
-        metadatas=[{"id": doc_id, "filename": file.filename}] * len(chunks),
+        metadatas=[meta_base] * len(chunks),
         ids=[str(uuid.uuid4()) for _ in chunks]
     )
-
     return {
         "status": "stored",
         "id": doc_id
     }
 
 
+# Returns list of stored document names for UI table and download links.
 @app.get("/documents/list")
-def list_documents(_user: dict | None = Depends(auth.get_current_user_optional)):
-    """Return list of stored document names for UI table and download links."""
-    return {"documents": storage_module.list_files()}
+def list_documents(user: dict | None = Depends(auth.get_current_user_optional)):
+    user_id = _user_id(user)
+    keys = storage_module.list_files(user_id=user_id)
+    return {"documents": [{"name": os.path.basename(k)} for k in keys]}
 
 
+# Serves document download. Requires auth when enabled; token may be in query for browser links (no Bearer on link click).
 @app.get("/documents/download")
 def download_document(request: Request, filename: str):
-    # Require auth when enabled; allow token in query for download links (browser can't send Bearer on link click)
+    user = None
     if auth.auth_enabled():
-        user = None
         auth_header = request.headers.get("Authorization")
         if auth_header and auth_header.startswith("Bearer "):
             user = auth.decode_session_token(auth_header[7:].strip())
@@ -274,13 +305,17 @@ def download_document(request: Request, filename: str):
                 user = auth.decode_session_token(token)
         if not user:
             raise HTTPException(status_code=401, detail="Not authenticated")
+    user_id = _user_id(user)
     safe = safe_filename(filename)
+    key = f"{user_id}/{safe}" if user_id else safe
+    if user_id and not key.startswith(user_id + "/"):
+        raise HTTPException(status_code=403, detail="Forbidden")
     if storage_module.is_s3():
-        url = storage_module.get_presigned_url(safe)
+        url = storage_module.get_presigned_url(key)
         if not url:
             raise HTTPException(status_code=404, detail="Document not found")
         return RedirectResponse(url=url, status_code=302)
-    path = storage_module.get_file_path(safe)
+    path = storage_module.get_file_path(key)
     if not path:
         raise HTTPException(status_code=404, detail="Document not found")
     return FileResponse(path, filename=filename, media_type="application/pdf")

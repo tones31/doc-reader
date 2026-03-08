@@ -24,10 +24,12 @@ JWT_EXPIRY_SECONDS = 7 * 24 * 3600  # 7 days
 STATE_EXPIRY_SECONDS = 600  # 10 minutes
 
 
+# Returns True if Google OAuth and JWT are configured (GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, JWT_SECRET set).
 def auth_enabled() -> bool:
     return bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and JWT_SECRET)
 
 
+# Encodes a short-lived state JWT for OAuth CSRF protection (rnd + exp).
 def encode_state() -> str:
     payload = {
         "rnd": secrets.token_urlsafe(16),
@@ -36,6 +38,7 @@ def encode_state() -> str:
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 
+# Decodes the state JWT; returns payload dict or None if invalid/expired.
 def decode_state(token: str) -> dict[str, Any] | None:
     try:
         return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
@@ -43,7 +46,7 @@ def decode_state(token: str) -> dict[str, Any] | None:
         return None
 
 
-# Return the authorization URL and the state
+# Returns the Google OAuth authorization URL and the state value for the given redirect_uri.
 def build_google_auth_url(redirect_uri: str) -> tuple[str, str]:
     state = encode_state()
     params = {
@@ -56,7 +59,7 @@ def build_google_auth_url(redirect_uri: str) -> tuple[str, str]:
     url = GOOGLE_AUTH_URL + "?" + urllib.parse.urlencode(params)
     return url, state
 
-# Validate state, exchange code for tokens, fetch userinfo. Return {"sub", "email", "name"} or None.
+# Validates state, exchanges code for tokens, fetches userinfo. Returns {"sub", "email", "name"} or None.
 def exchange_code_for_user(code: str, state: str, redirect_uri: str) -> dict[str, Any] | None:
     if not decode_state(state):
         return None
@@ -86,19 +89,23 @@ def exchange_code_for_user(code: str, state: str, redirect_uri: str) -> dict[str
         "sub": info.get("id"),
         "email": info.get("email") or "",
         "name": info.get("name") or info.get("email") or "User",
+        "picture": info.get("picture") or "",
     }
 
 
+# Creates a session JWT from user dict (sub, email, name, picture) with standard expiry.
 def create_session_token(user: dict[str, Any]) -> str:
     payload = {
         "sub": user.get("sub"),
         "email": user.get("email"),
         "name": user.get("name"),
+        "picture": user.get("picture") or "",
         "exp": int(time.time()) + JWT_EXPIRY_SECONDS,
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 
+# Decodes the session JWT; returns payload dict or None if invalid/expired.
 def decode_session_token(token: str) -> dict[str, Any] | None:
     try:
         return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
@@ -106,7 +113,7 @@ def decode_session_token(token: str) -> dict[str, Any] | None:
         return None
 
 
-# FastAPI dependency: require Authorization Bearer JWT and return user payload. Raise 401 if auth disabled or invalid.
+# FastAPI dependency: requires Authorization Bearer JWT and returns user payload. Raises 401 if auth disabled or invalid.
 def get_current_user(request: Request) -> dict[str, Any]:
     if not auth_enabled():
         raise HTTPException(status_code=501, detail="Auth not configured")
@@ -119,7 +126,7 @@ def get_current_user(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
     return user
 
-# When auth is enabled: require Bearer JWT and return user or 401. When disabled: return None (no auth required).
+# When auth enabled: requires Bearer JWT and returns user or 401. When disabled: returns None (no auth required).
 def get_current_user_optional(request: Request) -> dict[str, Any] | None:
     if not auth_enabled():
         return None

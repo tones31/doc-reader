@@ -18,13 +18,28 @@ token_from_url = st.query_params.get("token")
 if token_from_url:
     st.session_state.auth_token = token_from_url
 
+# Handle sign-out: clear auth, remove token from URL, then fall through to show the login page
+if st.session_state.pop("_sign_out", False):
+    if "auth_token" in st.session_state:
+        del st.session_state["auth_token"]
+    if "auth_user" in st.session_state:
+        del st.session_state["auth_user"]
+    if "token" in st.query_params:
+        del st.query_params["token"]
+    # Fall through so we hit "if not st.session_state.get('auth_token')" and show login
+
+
+def do_sign_out():
+    st.session_state["_sign_out"] = True
+
+
+# Returns the Authorization Bearer header when a token is in session; empty dict when no token (backend may allow unauthenticated when SSO not configured).
 def api_headers():
-    """Authorization header when we have a token (backend may still allow unauthenticated when SSO not configured)."""
     token = st.session_state.get("auth_token")
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 # When no token, probe backend: 401 -> auth required (show login); 200 with email/name -> auth disabled, continue
-if not st.session_state.auth_token:
+if not st.session_state.get("auth_token"):
     try:
         me_resp = requests.get(f"{API_URL}/auth/me", timeout=5)
         if me_resp.status_code == 401:
@@ -41,7 +56,7 @@ if not st.session_state.auth_token:
         pass
 
 # Optional: cache user info for header/settings (call /auth/me when we have token)
-if st.session_state.auth_token and "auth_user" not in st.session_state:
+if st.session_state.get("auth_token") and "auth_user" not in st.session_state:
     try:
         r = requests.get(f"{API_URL}/auth/me", headers=api_headers(), timeout=5)
         if r.status_code == 200:
@@ -55,13 +70,36 @@ if st.session_state.auth_token and "auth_user" not in st.session_state:
             st.session_state.auth_user = None
     except Exception:
         st.session_state.auth_user = None
-elif not st.session_state.auth_token and "auth_user" in st.session_state:
+elif not st.session_state.get("auth_token") and "auth_user" in st.session_state:
     del st.session_state["auth_user"]
 
 # Centered: side margins + wide middle (header and content same width)
 _col_left, col_main, _col_right = st.columns([1, 5, 1])
 with col_main:
-    st.title("Resume Search")
+    # Header row: title left, user avatar + logout right
+    header_left, header_right = st.columns([4, 1])
+    with header_left:
+        st.title("Resume Search")
+    with header_right:
+        auth_user = st.session_state.get("auth_user") or {}
+        if st.session_state.get("auth_token") and auth_user:
+            pic_url = auth_user.get("picture")
+            name = auth_user.get("name") or auth_user.get("email") or "User"
+            initials = "".join(w[0] for w in name.split()[:2]).upper() if name else "?"
+            # Click avatar (initials or icon) to open dropdown
+            st.markdown(
+                "<style>div[data-testid='stPopover'] button { border-radius: 50% !important; width: 40px !important; height: 40px !important; padding: 0 !important; min-width: 40px !important; font-weight: bold; }</style>",
+                unsafe_allow_html=True,
+            )
+            with st.popover(initials if initials else "👤"):
+                if pic_url:
+                    st.image(pic_url, width=64)
+                st.caption(name)
+                if auth_user.get("email"):
+                    st.caption(auth_user.get("email"))
+                st.divider()
+                if st.button("Sign out", key="header_sign_out", on_click=do_sign_out):
+                    pass
     tab_ask, tab_resumes, tab_settings = st.tabs(["Ask", "Resumes", "Settings"])
 
 # --- Ask tab: full-width input bar + button inline, then results ---
@@ -134,7 +172,7 @@ with tab_ask:
                 if c.get("filename", "").lower().endswith(".pdf"):
                     download_url = f"{API_URL}/documents/download?filename={requests.utils.quote(c['filename'])}"
                     if st.session_state.get("auth_token"):
-                        download_url += f"&token={requests.utils.quote(st.session_state.auth_token)}"
+                        download_url += f"&token={requests.utils.quote(st.session_state.get('auth_token', ''))}"
                     st.link_button("Download PDF", download_url)
                 else:
                     st.write("—")
@@ -239,7 +277,7 @@ with tab_resumes:
                 if name.lower().endswith(".pdf"):
                     download_url = f"{API_URL}/documents/download?filename={requests.utils.quote(name)}"
                     if st.session_state.get("auth_token"):
-                        download_url += f"&token={requests.utils.quote(st.session_state.auth_token)}"
+                        download_url += f"&token={requests.utils.quote(st.session_state.get('auth_token', ''))}"
                     st.link_button("Download", download_url)
                 else:
                     st.write("—")
@@ -256,19 +294,9 @@ with tab_resumes:
                 st.session_state.resumes_page = page + 1
                 st.rerun()
 
-# --- Settings tab: danger zone + sign out ---
+# --- Settings tab: danger zone ---
 with tab_settings:
     st.caption("App configuration and destructive actions.")
-    if st.session_state.get("auth_token"):
-        auth_user = st.session_state.get("auth_user") or {}
-        if auth_user.get("email"):
-            st.caption(f"Signed in as **{auth_user.get('email', '')}**")
-        if st.button("Sign out"):
-            del st.session_state["auth_token"]
-            if "auth_user" in st.session_state:
-                del st.session_state["auth_user"]
-            st.rerun()
-        st.divider()
     with st.expander("⚠️ Danger zone"):
         if st.checkbox("I want to reset the resume database"):
             if st.button("Reset database"):
