@@ -214,6 +214,12 @@ def ingest_pdf(file: UploadFile = File(...)):
     }
 
 
+@app.get("/documents/list")
+def list_documents():
+    """Return list of stored document names for UI table and download links."""
+    return {"documents": storage_module.list_files()}
+
+
 @app.get("/documents/download")
 def download_document(filename: str):
     safe = safe_filename(filename)
